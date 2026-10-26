@@ -35,12 +35,17 @@ import java.util.Locale;
 public class MainActivity extends Activity {
     private LocationManager locationManager;
     private TextView speedText, statusText, statsText, unitText;
+    private Button pauseButton;
     private SpeedometerView speedometer;
     private SpeedChartView chart;
     private final ArrayList<Sample> samples = new ArrayList<>();
     private boolean recording = true;
+    private boolean paused = false;
+    private boolean hasSmoothedSpeed = false;
+    private double smoothedKmh = 0;
     private double currentKmh = 0, maxKmh = 0, distanceM = 0;
     private long startMs = 0;
+    private long pauseStartedMs = 0, totalPausedMs = 0;
     private Location lastLocation;
     private String unit = "km/h";
     private static final int REQ_LOCATION = 31;
@@ -82,47 +87,91 @@ public class MainActivity extends Activity {
         LinearLayout right = new LinearLayout(this); right.setOrientation(LinearLayout.VERTICAL); right.setPadding(dp(8),dp(4),0,0);
         TextView chartTitle = label("速度曲线 · km/h",15,Color.WHITE); chartTitle.setGravity(Gravity.LEFT|Gravity.CENTER_VERTICAL); right.addView(chartTitle,new LinearLayout.LayoutParams(-1,dp(30)));
         chart = new SpeedChartView(this); right.addView(chart,new LinearLayout.LayoutParams(-1,0,1));
-        LinearLayout controls = new LinearLayout(this); controls.setGravity(Gravity.CENTER_VERTICAL); controls.setOrientation(LinearLayout.HORIZONTAL);
-        Button reset = button("重新开始"); reset.setOnClickListener(v -> resetSession()); controls.addView(reset,new LinearLayout.LayoutParams(0,dp(44),1));
-        Button unitBtn = button("km/h ⇄ mph"); unitBtn.setOnClickListener(v -> { unit = unit.equals("km/h") ? "mph" : "km/h"; unitText.setText(" "+unit); speedText.setText(formatSpeed(currentKmh)); speedometer.invalidate(); }); controls.addView(unitBtn,new LinearLayout.LayoutParams(0,dp(44),1));
-        Button csv = button("导出 CSV"); csv.setOnClickListener(v -> exportCsv()); controls.addView(csv,new LinearLayout.LayoutParams(0,dp(44),1));
-        Button png = button("导出曲线图"); png.setOnClickListener(v -> exportPng()); controls.addView(png,new LinearLayout.LayoutParams(0,dp(44),1));
+        LinearLayout controls = new LinearLayout(this); controls.setGravity(Gravity.CENTER_VERTICAL); controls.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout controlsTop = new LinearLayout(this); controlsTop.setGravity(Gravity.CENTER_VERTICAL);
+        pauseButton = button("暂停测速"); pauseButton.setOnClickListener(v -> togglePause()); controlsTop.addView(pauseButton,new LinearLayout.LayoutParams(0,dp(42),1));
+        Button reset = button("重新开始"); reset.setOnClickListener(v -> resetSession()); controlsTop.addView(reset,new LinearLayout.LayoutParams(0,dp(42),1));
+        Button unitBtn = button("km/h ⇄ mph"); unitBtn.setOnClickListener(v -> { unit = unit.equals("km/h") ? "mph" : "km/h"; unitText.setText(" "+unit); speedText.setText(formatSpeed(currentKmh)); speedometer.invalidate(); }); controlsTop.addView(unitBtn,new LinearLayout.LayoutParams(0,dp(42),1));
+        controls.addView(controlsTop,new LinearLayout.LayoutParams(-1,dp(44)));
+        LinearLayout controlsBottom = new LinearLayout(this); controlsBottom.setGravity(Gravity.CENTER_VERTICAL);
+        Button csv = button("导出 CSV"); csv.setOnClickListener(v -> exportCsv()); controlsBottom.addView(csv,new LinearLayout.LayoutParams(0,dp(42),1));
+        Button png = button("导出曲线图"); png.setOnClickListener(v -> exportPng()); controlsBottom.addView(png,new LinearLayout.LayoutParams(0,dp(42),1));
+        controls.addView(controlsBottom,new LinearLayout.LayoutParams(-1,dp(44)));
         right.addView(controls); body.addView(right,new LinearLayout.LayoutParams(0,-1,1.45f)); root.addView(body,new LinearLayout.LayoutParams(-1,0,1)); setContentView(root);
     }
     private String formatSpeed(double kmh) { return String.format(Locale.US, "%.0f", unit.equals("mph") ? kmh*0.621371 : kmh); }
     private void startGps() {
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED && checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) { statusText.setText("需要定位权限"); return; }
         try {
+            if (paused) { statusText.setText("测速已暂停"); return; }
             if (!locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) statusText.setText("请开启手机定位/GPS");
-            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 500, 0, listener);
+            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 250, 0, listener);
             statusText.setText("正在获取卫星定位…");
         } catch (SecurityException e) { statusText.setText("定位权限不足"); }
         catch (Exception e) { statusText.setText("GPS 暂不可用"); }
     }
     private final LocationListener listener = new LocationListener() {
         @Override public void onLocationChanged(Location loc) {
-            if (loc.hasAccuracy() && loc.getAccuracy() > 50) { statusText.setText(String.format(Locale.US,"定位精度较低 ±%.0fm",loc.getAccuracy())); }
-            else statusText.setText(String.format(Locale.US,"GPS 已定位 · 精度 ±%.0fm",loc.hasAccuracy()?loc.getAccuracy():0));
-            double kmh = loc.hasSpeed() ? loc.getSpeed()*3.6 : 0;
+            if (paused) return;
+            // Reject weak fixes before they can create speed spikes or distort the distance.
+            if (loc.hasAccuracy() && loc.getAccuracy() > 35f) {
+                statusText.setText(String.format(Locale.US,"GPS 信号较弱 · 精度 ±%.0fm（等待更好信号）",loc.getAccuracy()));
+                return;
+            }
+            statusText.setText(String.format(Locale.US,"GPS 已定位 · 精度 ±%.0fm",loc.hasAccuracy()?loc.getAccuracy():0));
+            double rawKmh = loc.hasSpeed() ? Math.max(0, loc.getSpeed()*3.6) : 0;
             if (lastLocation != null) {
                 long dt = loc.getTime()-lastLocation.getTime();
                 float d = loc.distanceTo(lastLocation);
-                if (dt > 0 && dt < 10000 && d < 1000) distanceM += d;
+                if (dt > 0 && dt <= 5000 && d < 150) {
+                    distanceM += d;
+                    if (!loc.hasSpeed()) rawKmh = d * 3.6 / (dt / 1000.0);
+                }
             }
-            lastLocation = loc; currentKmh = Math.max(0,kmh); maxKmh = Math.max(maxKmh,currentKmh);
-            if (recording) { samples.add(new Sample(System.currentTimeMillis(),currentKmh,loc.hasAccuracy()?loc.getAccuracy():-1)); if (samples.size()>3600) samples.remove(0); }
+            // Light exponential smoothing reduces GPS jitter without making the display too sluggish.
+            if (!hasSmoothedSpeed) { smoothedKmh = rawKmh; hasSmoothedSpeed = true; }
+            else smoothedKmh = smoothedKmh * 0.65 + rawKmh * 0.35;
+            lastLocation = new Location(loc);
+            currentKmh = Math.max(0, smoothedKmh);
+            maxKmh = Math.max(maxKmh,currentKmh);
+            if (recording) {
+                samples.add(new Sample(System.currentTimeMillis(),currentKmh,loc.hasAccuracy()?loc.getAccuracy():-1));
+                if (samples.size()>3600) samples.remove(0);
+            }
             speedText.setText(formatSpeed(currentKmh)); speedometer.setSpeed(currentKmh); chart.invalidate(); updateStats();
         }
         @Override public void onProviderEnabled(String p) { statusText.setText("GPS 已开启，正在定位…"); }
         @Override public void onProviderDisabled(String p) { statusText.setText("GPS 已关闭"); }
     };
     private void updateStats() {
-        double sum=0; for(Sample s:samples) sum+=s.speed; double avg=samples.isEmpty()?0:sum/samples.size(); long secs=(System.currentTimeMillis()-startMs)/1000;
+        double sum=0; for(Sample s:samples) sum+=s.speed; double avg=samples.isEmpty()?0:sum/samples.size(); long now=System.currentTimeMillis(); long elapsed=now-startMs-totalPausedMs-(paused && pauseStartedMs>0 ? now-pauseStartedMs : 0); long secs=Math.max(0,elapsed/1000);
         statsText.setText(String.format(Locale.US,"最高 %.1f   ·   平均 %.1f km/h\n距离 %s   ·   时长 %02d:%02d",maxKmh,avg,distanceM>=1000?String.format(Locale.US,"%.2f km",distanceM/1000):String.format(Locale.US,"%.0f m",distanceM),secs/60,secs%60));
     }
-    private void resetSession() { samples.clear(); maxKmh=0; distanceM=0; startMs=System.currentTimeMillis(); lastLocation=null; chart.invalidate(); updateStats(); Toast.makeText(this,"已开始新的测速记录",Toast.LENGTH_SHORT).show(); }
+    private void togglePause() {
+        paused = !paused;
+        lastLocation = null;
+        hasSmoothedSpeed = false;
+        if (paused) {
+            pauseStartedMs = System.currentTimeMillis();
+            if (locationManager != null) locationManager.removeUpdates(listener);
+            currentKmh = 0;
+            speedText.setText(formatSpeed(0)); speedometer.setSpeed(0);
+            pauseButton.setText("继续测速"); statusText.setText("测速已暂停 · 记录已保留");
+            updateStats();
+        } else {
+            if (pauseStartedMs > 0) totalPausedMs += System.currentTimeMillis() - pauseStartedMs;
+            pauseStartedMs = 0;
+            pauseButton.setText("暂停测速");
+            startGps();
+        }
+    }
+    private void resetSession() {
+        samples.clear(); maxKmh=0; distanceM=0; startMs=System.currentTimeMillis(); totalPausedMs=0; pauseStartedMs=paused?startMs:0; lastLocation=null; hasSmoothedSpeed=false; smoothedKmh=0; currentKmh=0;
+        speedText.setText(formatSpeed(0)); speedometer.setSpeed(0); chart.invalidate(); updateStats();
+        Toast.makeText(this,"已开始新的测速记录",Toast.LENGTH_SHORT).show();
+    }
     @Override public void onRequestPermissionsResult(int requestCode,String[] permissions,int[] results) { super.onRequestPermissionsResult(requestCode,permissions,results); if(requestCode==REQ_LOCATION) { boolean ok=false; for(int r:results) if(r==PackageManager.PERMISSION_GRANTED) ok=true; if(ok) startGps(); else statusText.setText("未授权定位，无法测速"); } }
-    @Override protected void onResume() { super.onResume(); if(locationManager!=null && (Build.VERSION.SDK_INT<23 || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)==PackageManager.PERMISSION_GRANTED)) startGps(); }
+    @Override protected void onResume() { super.onResume(); if(!paused && locationManager!=null && (Build.VERSION.SDK_INT<23 || checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)==PackageManager.PERMISSION_GRANTED)) startGps(); }
     @Override protected void onPause() { super.onPause(); if(locationManager!=null) locationManager.removeUpdates(listener); }
     private Uri createExport(String name,String mime) throws Exception {
         ContentValues values=new ContentValues(); values.put(MediaStore.MediaColumns.DISPLAY_NAME,name); values.put(MediaStore.MediaColumns.MIME_TYPE,mime);
@@ -152,7 +201,7 @@ public class MainActivity extends Activity {
     }
     private static class Sample { long time; double speed; float accuracy; Sample(long t,double s,float a){time=t;speed=s;accuracy=a;} }
     private class SpeedometerView extends View {
-        Paint p=new Paint(3); double speed=0; SpeedometerView(Activity a){super(a);setLayerType(View.LAYER_TYPE_SOFTWARE,null);} void setSpeed(double s){speed=s;invalidate();}
+        Paint p=new Paint(3); double speed=0; SpeedometerView(Activity a){super(a);setLayerType(View.LAYER_TYPE_HARDWARE,null);} void setSpeed(double s){speed=s;invalidate();}
         @Override protected void onDraw(Canvas c){super.onDraw(c);float w=getWidth(),h=getHeight(),cx=w/2,cy=h*.83f,rad=Math.min(w*.43f,h*.9f);p.setStyle(Paint.Style.STROKE);p.setStrokeWidth(dp(10));p.setStrokeCap(Paint.Cap.ROUND);p.setColor(Color.rgb(53,65,77));c.drawArc(cx-rad,cy-rad,cx+rad,cy+rad,180,180,false,p);p.setColor(Color.rgb(34,197,94));c.drawArc(cx-rad,cy-rad,cx+rad,cy+rad,180,(float)(180*Math.min(1,speed/240)),false,p);
             p.setStrokeWidth(dp(2));p.setColor(Color.LTGRAY);p.setTextSize(dp(10));p.setStyle(Paint.Style.FILL);for(int i=0;i<=12;i++){double a=Math.PI+(Math.PI*i/12);float x1=(float)(cx+(rad-dp(4))*Math.cos(a)),y1=(float)(cy+(rad-dp(4))*Math.sin(a));float x2=(float)(cx+(rad-dp(15))*Math.cos(a)),y2=(float)(cy+(rad-dp(15))*Math.sin(a));c.drawLine(x1,y1,x2,y2,p);String s=""+(i*20);c.drawText(s,(float)(cx+(rad-dp(28))*Math.cos(a)-dp(7)),(float)(cy+(rad-dp(28))*Math.sin(a)+dp(4)),p);}
             double a=Math.PI+Math.PI*Math.min(1,speed/240);p.setColor(Color.rgb(248,113,113));p.setStrokeWidth(dp(3));c.drawLine(cx,cy,(float)(cx+(rad-dp(28))*Math.cos(a)),(float)(cy+(rad-dp(28))*Math.sin(a)),p);p.setColor(Color.WHITE);c.drawCircle(cx,cy,dp(6),p); }
